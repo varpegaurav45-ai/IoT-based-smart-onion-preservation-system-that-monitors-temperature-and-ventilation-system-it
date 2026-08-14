@@ -1,0 +1,628 @@
+/*
+  ============================================================
+      SMART ONION PRESERVATION SYSTEM
+      ESP32 IoT Controller
+  ============================================================
+
+  FUNCTIONS:
+    1. Temperature monitoring       -> DHT22
+    2. Humidity monitoring          -> DHT22
+    3. Ethylene monitoring          -> Analog ethylene sensor
+    4. Compartment damage detection -> 4 normally-closed sensors
+    5. Local buzzer alarm
+    6. Farmer notification          -> Telegram Bot
+    7. Wi-Fi connectivity
+    8. Serial monitoring
+
+  IMPORTANT:
+    - Ethylene threshold must be calibrated for your actual sensor.
+    - The ethylene sensor input is treated as a relative indication.
+    - A compartment damage sensor must be physically installed
+      in each compartment.
+*/
+
+// ============================================================
+// LIBRARIES
+// ============================================================
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <DHT.h>
+
+// ============================================================
+// WIFI SETTINGS
+// ============================================================
+
+const char* WIFI_SSID = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// ============================================================
+// TELEGRAM SETTINGS
+// ============================================================
+
+// Create a bot using Telegram's @BotFather.
+// Put the token here.
+//
+// Example format:
+// 123456789:AAExampleToken
+//
+const char* BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN";
+
+// Your Telegram chat ID
+const char* CHAT_ID = "YOUR_TELEGRAM_CHAT_ID";
+
+// ============================================================
+// DHT22
+// ============================================================
+
+#define DHT_PIN 4
+#define DHT_TYPE DHT22
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ============================================================
+// ETHYLENE SENSOR
+// ============================================================
+
+// ESP32 ADC pin
+#define ETHYLENE_PIN 34
+
+// IMPORTANT:
+// This is only a prototype threshold.
+// Calibrate it with your actual ethylene sensor.
+const int ETHYLENE_LIMIT = 1800;
+
+// ============================================================
+// COMPARTMENT DAMAGE SENSORS
+// ============================================================
+//
+// Use normally-CLOSED switches / tamper loops.
+//
+// Normal condition:
+// sensor pin = LOW
+//
+// Damaged/open condition:
+// sensor pin = HIGH
+//
+// GPIOs are configured using INPUT_PULLUP.
+//
+
+#define COMPARTMENT_1_PIN 25
+#define COMPARTMENT_2_PIN 26
+#define COMPARTMENT_3_PIN 27
+#define COMPARTMENT_4_PIN 14
+
+// ============================================================
+// OUTPUTS
+// ============================================================
+
+#define BUZZER_PIN 13
+#define STATUS_LED_PIN 2
+
+// ============================================================
+// TEMPERATURE / HUMIDITY LIMITS
+// ============================================================
+//
+// These are prototype values.
+// Onion-specific storage limits should be calibrated
+// according to your storage design and operating conditions.
+//
+
+const float TEMPERATURE_MAX = 30.0;
+const float HUMIDITY_MAX = 70.0;
+
+// ============================================================
+// VARIABLES
+// ============================================================
+
+float temperature = 0.0;
+float humidity = 0.0;
+
+int ethyleneValue = 0;
+
+bool compartment1Damaged = false;
+bool compartment2Damaged = false;
+bool compartment3Damaged = false;
+bool compartment4Damaged = false;
+
+bool environmentalAlert = false;
+bool damageAlert = false;
+
+bool previousEnvironmentalAlert = false;
+bool previousDamageAlert = false;
+
+unsigned long lastSensorRead = 0;
+unsigned long lastTelegramAlert = 0;
+
+// Prevent repeated Telegram messages
+const unsigned long TELEGRAM_ALERT_INTERVAL = 10UL * 60UL * 1000UL;
+
+// ============================================================
+// READ COMPARTMENT STATUS
+// ============================================================
+
+void readCompartmentSensors()
+{
+  compartment1Damaged = digitalRead(COMPARTMENT_1_PIN) == HIGH;
+  compartment2Damaged = digitalRead(COMPARTMENT_2_PIN) == HIGH;
+  compartment3Damaged = digitalRead(COMPARTMENT_3_PIN) == HIGH;
+  compartment4Damaged = digitalRead(COMPARTMENT_4_PIN) == HIGH;
+
+  damageAlert =
+    compartment1Damaged ||
+    compartment2Damaged ||
+    compartment3Damaged ||
+    compartment4Damaged;
+}
+
+// ============================================================
+// READ ENVIRONMENTAL SENSORS
+// ============================================================
+
+void readEnvironmentalSensors()
+{
+  float newTemperature = dht.readTemperature();
+  float newHumidity = dht.readHumidity();
+
+  // Check DHT22 reading
+  if (!isnan(newTemperature))
+  {
+    temperature = newTemperature;
+  }
+
+  if (!isnan(newHumidity))
+  {
+    humidity = newHumidity;
+  }
+
+  // Read ethylene sensor
+  ethyleneValue = analogRead(ETHYLENE_PIN);
+
+  // Environmental safety condition
+  environmentalAlert =
+    (temperature > TEMPERATURE_MAX) ||
+    (humidity > HUMIDITY_MAX) ||
+    (ethyleneValue > ETHYLENE_LIMIT);
+}
+
+// ============================================================
+// SEND TELEGRAM MESSAGE
+// ============================================================
+
+void sendTelegramMessage(String message)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("Wi-Fi not connected. Telegram alert not sent.");
+    return;
+  }
+
+  WiFiClientSecure client;
+
+  // For prototype use.
+  // For production, use certificate validation.
+  client.setInsecure();
+
+  HTTPClient https;
+
+  String url =
+    "https://api.telegram.org/bot" +
+    String(BOT_TOKEN) +
+    "/sendMessage";
+
+  if (!https.begin(client, url))
+  {
+    Serial.println("Unable to connect to Telegram.");
+    return;
+  }
+
+  https.addHeader(
+    "Content-Type",
+    "application/x-www-form-urlencoded"
+  );
+
+  String encodedMessage = message;
+
+  // Basic URL encoding for important characters
+  encodedMessage.replace("%", "%25");
+  encodedMessage.replace(" ", "%20");
+  encodedMessage.replace("\n", "%0A");
+  encodedMessage.replace(":", "%3A");
+
+  String postData =
+    "chat_id=" + String(CHAT_ID) +
+    "&text=" + encodedMessage;
+
+  int httpCode = https.POST(postData);
+
+  if (httpCode > 0)
+  {
+    Serial.print("Telegram HTTP response: ");
+    Serial.println(httpCode);
+
+    Serial.println(https.getString());
+  }
+  else
+  {
+    Serial.print("Telegram error: ");
+    Serial.println(httpCode);
+  }
+
+  https.end();
+}
+
+// ============================================================
+// CREATE DAMAGE ALERT MESSAGE
+// ============================================================
+
+String createDamageMessage()
+{
+  String message = "";
+
+  message += "🚨 SMART ONION STORAGE ALERT\n\n";
+
+  message += "COMPARTMENT DAMAGE DETECTED\n\n";
+
+  if (compartment1Damaged)
+  {
+    message += "❌ Compartment 1: DAMAGE / OPEN\n";
+  }
+
+  if (compartment2Damaged)
+  {
+    message += "❌ Compartment 2: DAMAGE / OPEN\n";
+  }
+
+  if (compartment3Damaged)
+  {
+    message += "❌ Compartment 3: DAMAGE / OPEN\n";
+  }
+
+  if (compartment4Damaged)
+  {
+    message += "❌ Compartment 4: DAMAGE / OPEN\n";
+  }
+
+  message += "\nCurrent storage conditions:\n";
+
+  message += "Temperature: ";
+  message += String(temperature, 1);
+  message += " C\n";
+
+  message += "Humidity: ";
+  message += String(humidity, 1);
+  message += " %\n";
+
+  message += "Ethylene level: ";
+  message += String(ethyleneValue);
+  message += "\n";
+
+  message += "\nPlease inspect the affected compartment.";
+
+  return message;
+}
+
+// ============================================================
+// CREATE ENVIRONMENTAL ALERT MESSAGE
+// ============================================================
+
+String createEnvironmentalMessage()
+{
+  String message = "";
+
+  message += "⚠️ SMART ONION STORAGE WARNING\n\n";
+
+  message += "Abnormal storage condition detected.\n\n";
+
+  message += "Temperature: ";
+  message += String(temperature, 1);
+  message += " C\n";
+
+  message += "Humidity: ";
+  message += String(humidity, 1);
+  message += " %\n";
+
+  message += "Ethylene level: ";
+  message += String(ethyleneValue);
+  message += "\n\n";
+
+  if (temperature > TEMPERATURE_MAX)
+  {
+    message += "⚠️ Temperature is high\n";
+  }
+
+  if (humidity > HUMIDITY_MAX)
+  {
+    message += "⚠️ Humidity is high\n";
+  }
+
+  if (ethyleneValue > ETHYLENE_LIMIT)
+  {
+    message += "⚠️ Ethylene level is above prototype threshold\n";
+  }
+
+  message += "\nPlease inspect onion storage conditions.";
+
+  return message;
+}
+
+// ============================================================
+// LOCAL ALARM
+// ============================================================
+
+void updateAlarm()
+{
+  if (environmentalAlert || damageAlert)
+  {
+    digitalWrite(BUZZER_PIN, HIGH);
+    digitalWrite(STATUS_LED_PIN, HIGH);
+  }
+  else
+  {
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(STATUS_LED_PIN, LOW);
+  }
+}
+
+// ============================================================
+// SEND ALERTS ONLY WHEN NEEDED
+// ============================================================
+
+void processAlerts()
+{
+  unsigned long currentTime = millis();
+
+  // ----------------------------------------------------------
+  // NEW DAMAGE ALERT
+  // ----------------------------------------------------------
+
+  if (damageAlert && !previousDamageAlert)
+  {
+    sendTelegramMessage(createDamageMessage());
+
+    lastTelegramAlert = currentTime;
+  }
+
+  // ----------------------------------------------------------
+  // NEW ENVIRONMENTAL ALERT
+  // ----------------------------------------------------------
+
+  if (environmentalAlert && !previousEnvironmentalAlert)
+  {
+    sendTelegramMessage(createEnvironmentalMessage());
+
+    lastTelegramAlert = currentTime;
+  }
+
+  // ----------------------------------------------------------
+  // PERIODIC ALERT IF CONDITION CONTINUES
+  // ----------------------------------------------------------
+
+  if ((damageAlert || environmentalAlert) &&
+      (currentTime - lastTelegramAlert >= TELEGRAM_ALERT_INTERVAL))
+  {
+    if (damageAlert)
+    {
+      sendTelegramMessage(createDamageMessage());
+    }
+    else if (environmentalAlert)
+    {
+      sendTelegramMessage(createEnvironmentalMessage());
+    }
+
+    lastTelegramAlert = currentTime;
+  }
+
+  // Save previous states
+  previousDamageAlert = damageAlert;
+  previousEnvironmentalAlert = environmentalAlert;
+}
+
+// ============================================================
+// SERIAL MONITOR
+// ============================================================
+
+void printSystemStatus()
+{
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("       SMART ONION PRESERVATION");
+  Serial.println("========================================");
+
+  Serial.print("Temperature: ");
+  Serial.print(temperature, 1);
+  Serial.println(" C");
+
+  Serial.print("Humidity: ");
+  Serial.print(humidity, 1);
+  Serial.println(" %");
+
+  Serial.print("Ethylene: ");
+  Serial.println(ethyleneValue);
+
+  Serial.println();
+
+  Serial.print("Compartment 1: ");
+  Serial.println(
+    compartment1Damaged ? "DAMAGED / OPEN" : "NORMAL"
+  );
+
+  Serial.print("Compartment 2: ");
+  Serial.println(
+    compartment2Damaged ? "DAMAGED / OPEN" : "NORMAL"
+  );
+
+  Serial.print("Compartment 3: ");
+  Serial.println(
+    compartment3Damaged ? "DAMAGED / OPEN" : "NORMAL"
+  );
+
+  Serial.print("Compartment 4: ");
+  Serial.println(
+    compartment4Damaged ? "DAMAGED / OPEN" : "NORMAL"
+  );
+
+  Serial.println();
+
+  Serial.print("Environmental status: ");
+  Serial.println(
+    environmentalAlert ? "WARNING" : "NORMAL"
+  );
+
+  Serial.print("Damage status: ");
+  Serial.println(
+    damageAlert ? "DAMAGE DETECTED" : "NORMAL"
+  );
+
+  Serial.println("========================================");
+}
+
+// ============================================================
+// WIFI CONNECTION
+// ============================================================
+
+void connectWiFi()
+{
+  Serial.println();
+  Serial.print("Connecting to Wi-Fi");
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attempts < 30)
+  {
+    delay(500);
+
+    Serial.print(".");
+
+    attempts++;
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("Wi-Fi connected.");
+
+    Serial.print("ESP32 IP address: ");
+    Serial.println(WiFi.localIP());
+  }
+  else
+  {
+    Serial.println("Wi-Fi connection failed.");
+  }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  // ----------------------------------------------------------
+  // GPIO CONFIGURATION
+  // ----------------------------------------------------------
+
+  pinMode(COMPARTMENT_1_PIN, INPUT_PULLUP);
+  pinMode(COMPARTMENT_2_PIN, INPUT_PULLUP);
+  pinMode(COMPARTMENT_3_PIN, INPUT_PULLUP);
+  pinMode(COMPARTMENT_4_PIN, INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(STATUS_LED_PIN, LOW);
+
+  // ----------------------------------------------------------
+  // ADC
+  // ----------------------------------------------------------
+
+  analogReadResolution(12);
+
+  // ----------------------------------------------------------
+  // DHT22
+  // ----------------------------------------------------------
+
+  dht.begin();
+
+  // ----------------------------------------------------------
+  // WIFI
+  // ----------------------------------------------------------
+
+  connectWiFi();
+
+  // ----------------------------------------------------------
+  // INITIAL READING
+  // ----------------------------------------------------------
+
+  delay(2000);
+
+  readEnvironmentalSensors();
+  readCompartmentSensors();
+
+  printSystemStatus();
+
+  // ----------------------------------------------------------
+  // STARTUP TELEGRAM MESSAGE
+  // ----------------------------------------------------------
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    String startupMessage = "";
+
+    startupMessage += "✅ SMART ONION PRESERVATION SYSTEM\n\n";
+    startupMessage += "ESP32 monitoring started.\n";
+    startupMessage += "Temperature, humidity, ethylene and compartment status are being monitored.";
+
+    sendTelegramMessage(startupMessage);
+  }
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop()
+{
+  // ----------------------------------------------------------
+  // READ SENSORS EVERY 2 SECONDS
+  // ----------------------------------------------------------
+
+  if (millis() - lastSensorRead >= 2000)
+  {
+    lastSensorRead = millis();
+
+    readEnvironmentalSensors();
+    readCompartmentSensors();
+
+    updateAlarm();
+
+    printSystemStatus();
+
+    processAlerts();
+  }
+
+  // ----------------------------------------------------------
+  // RECONNECT WIFI IF DISCONNECTED
+  // ----------------------------------------------------------
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    static unsigned long lastReconnect = 0;
+
+    if (millis() - lastReconnect >= 10000)
+    {
+      lastReconnect = millis();
+
+      Serial.println("Wi-Fi disconnected. Reconnecting...");
+
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
+  }
+}
